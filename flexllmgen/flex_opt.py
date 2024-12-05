@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.opt_config import OptConfig, get_opt_config, download_opt_weights
-from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
+from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchCXL, TorchLink,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexllmgen.timer import timers
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
@@ -38,10 +38,13 @@ class Policy:
     # percent = a means a%
     w_gpu_percent: float
     w_cpu_percent: float
+    w_cxl_percent: float
     cache_gpu_percent: float
     cache_cpu_percent: float
+    cache_cxl_percent: float
     act_gpu_percent: float
     act_cpu_percent: float
+    act_cxl_percent: float
 
     # Whether to overlap the I/O and compute
     overlap: bool
@@ -68,15 +71,15 @@ class Policy:
 
     @property
     def w_disk_percent(self):
-        return 100 - self.w_gpu_percent - self.w_cpu_percent
+        return 100 - self.w_gpu_percent - self.w_cpu_percent - self.w_cxl_percent
 
     @property
     def cache_disk_percent(self):
-        return 100 - self.cache_gpu_percent - self.cache_cpu_percent
+        return 100 - self.cache_gpu_percent - self.cache_cpu_percent - self.cache_cxl_percent
 
     @property
     def act_disk_percent(self):
-        return 100 - self.act_gpu_percent - self.act_cpu_percent
+        return 100 - self.act_gpu_percent - self.act_cpu_percent - self.act_cxl_percent
 
 
 def get_choice(cur_percent, percents, choices):
@@ -90,8 +93,8 @@ def get_choice(cur_percent, percents, choices):
 
 
 def init_weight_list(weight_specs, policy, env):
-    dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
-    dev_choices = [env.disk, env.cpu, env.gpu]
+    dev_percents = [policy.w_disk_percent, policy.w_cxl_percent, policy.w_cpu_percent, policy.w_gpu_percent]
+    dev_choices = [env.disk, env.cxl, env.cpu, env.gpu]
 
     sizes = [np.prod(spec[0]) for spec in weight_specs]
     sizes_cumsum = np.cumsum(sizes)
@@ -323,6 +326,8 @@ class SelfAttention:
             device = self.env.gpu
         elif self.policy.cache_cpu_percent == 100:
             device = self.env.cpu
+        elif self.policy.cache_cxl_percent == 100:
+            device = self.env.cxl
         elif self.policy.cache_disk_percent == 100:
             device = self.env.disk
         else:
@@ -609,6 +614,8 @@ class OptLM:
             self.act_home = self.env.gpu
         elif self.policy.act_cpu_percent == 100:
             self.act_home = self.env.cpu
+        elif self.policy.act_cxl_percent == 100:
+            self.act_home = self.env.cxl
         elif self.policy.act_disk_percent == 100:
             self.act_home = self.env.disk
         else:
@@ -1192,12 +1199,13 @@ def run_flexllmgen(args):
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
-    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+    cxl = TorchCXL(args.cxl_dir)
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, cxl=cxl, disk=disk, mixed=TorchMixedDevice([gpu, cpu, cxl, disk]))
 
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
-                    args.percent[0], args.percent[1],
-                    args.percent[2], args.percent[3],
-                    args.percent[4], args.percent[5],
+                    args.percent[0], args.percent[1], args.percent[2],
+                    args.percent[3], args.percent[4], args.percent[5],
+                    args.percent[6], args.percent[7], args.percent[8],
                     args.overlap, args.sep_layer, args.pin_weight,
                     args.cpu_cache_compute, args.attn_sparsity,
                     args.compress_weight,
@@ -1270,6 +1278,7 @@ def run_flexllmgen(args):
         decode_latency, decode_throughput, total_latency, total_throughput)
     if args.verbose >= 1:
         print(log_str)
+    print("at the end of run_flexllmgen")
 
 
 def add_parser_arguments(parser):
@@ -1278,8 +1287,10 @@ def add_parser_arguments(parser):
     parser.add_argument("--path", type=str, default="~/opt_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexLLMGen will automatically download them from HuggingFace.")
+    parser.add_argument("--cxl-dir", type=str, default="~/flexllmgen_cxl_dir",
+        help="The cxl directory to offload tensors. ")
     parser.add_argument("--offload-dir", type=str, default="~/flexllmgen_offload_dir",
-        help="The directory to offload tensors. ")
+        help="The disk directory to offload tensors. ")
     parser.add_argument("--prompt-len", type=int, default=512)
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--cut-gen-len", type=int,
@@ -1289,14 +1300,17 @@ def add_parser_arguments(parser):
     parser.add_argument("--gpu-batch-size", type=int, default=4)
     parser.add_argument("--num-gpu-batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
-        default=[100, 0, 100, 0, 100, 0],
-        help="Six numbers. They are "
+        default=[100, 0, 0, 100, 0, 0, 100, 0, 0],
+        help="Nine numbers. They are "
          "the percentage of weight on GPU, "
          "the percentage of weight on CPU, "
+         "the percentage of weight on CXL, "
          "the percentage of attention cache on GPU, "
          "the percentage of attention cache on CPU, "
+         "the percentage of attention cache on CXL, "
          "the percentage of activations on GPU, "
-         "the percentage of activations on CPU")
+         "the percentage of activations on CPU, "
+         "the percentage of activations on CXL")
     parser.add_argument("--sep-layer", type=str2bool, nargs='?',
         const=True, default=True)
     parser.add_argument("--pin-weight", type=str2bool, nargs="?",
@@ -1322,6 +1336,7 @@ if __name__ == "__main__":
     add_parser_arguments(parser)
     args = parser.parse_args()
 
-    assert len(args.percent) == 6
+    assert len(args.percent) == 9
 
     run_flexllmgen(args)
+    print("main: returned from run_flexllmgen")

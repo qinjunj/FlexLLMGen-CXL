@@ -36,19 +36,22 @@ class ExecutionEnv:
     """Hardware environment."""
     gpu: Any = None
     cpu: Any = None
+    cxl: Any = None
     disk: Any = None
     mixed: Any = None
 
     @classmethod
-    def create(cls, offload_dir):
+    def create(cls, cxl_dir, offload_dir):
         # fix recursive import
-        from flexllmgen.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
+        from flexllmgen.pytorch_backend import TorchDevice, TorchCXL, TorchDisk, TorchMixedDevice
         gpu = TorchDevice("cuda:0")
         cpu = TorchDevice("cpu")
+        cxl = TorchCXL(cxl_dir)
         disk = TorchDisk(offload_dir)
-        return cls(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+        return cls(gpu=gpu, cpu=cpu, cxl=cxl, disk=disk, mixed=TorchMixedDevice([gpu, cpu, cxl, disk]))
 
     def close_copy_threads(self):
+        # self.cxl.close_copy_threads()
         self.disk.close_copy_threads()
 
 

@@ -19,6 +19,7 @@ from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
+global_cxl_device = None
 global_disk_device = None
 
 
@@ -32,6 +33,7 @@ def fix_recursive_import():
 class DeviceType(Enum):
     CPU = auto()
     CUDA = auto()
+    CXL = auto()
     DISK = auto()
     MIXED = auto()
     COMPRESSED = auto()
@@ -42,6 +44,8 @@ class DeviceType(Enum):
             return DeviceType.CPU
         elif name == "cuda":
             return DeviceType.CUDA
+        elif name == "cxl":
+            return DeviceType.CXL
         elif name == "disk":
             return DeviceType.DISK
         elif name == "mixed":
@@ -154,6 +158,48 @@ class TorchTensor:
     def __str__(self):
         return (f"TorchTensor(shape={self.shape}, dtype={str(self.dtype)}, "
                 f"device={self.device.name if self.device else None})")
+
+class TorchCXL:
+    """Manage tensors stored on the CXL memory."""
+
+    def __init__(self, name, mem_capacity=None, flops=None):
+        self.name = name
+        self.mem_capacity = mem_capacity
+        self.flops = flops
+
+        self.dev = torch.device("cpu", index=1)
+        # self.device_type = DeviceType.convert(self.dev.type)
+        self.device_type = DeviceType.CXL
+        self.compressed_device = TorchCompressedDevice(self)
+
+        self.links = {}
+
+    def add_link(self, link):
+        dst = link.b if link.a == self else link.a
+        self.links[dst] = link
+        
+    def allocate(self, shape, dtype, pin_memory=None, name=None):
+        if self.device_type == DeviceType.CPU:
+            pin_memory = True if pin_memory is None else pin_memory
+        else:
+            pin_memory = False
+        dtype = np_dtype_to_torch_dtype[dtype]
+        data = torch.empty(shape, dtype=dtype, pin_memory=pin_memory, device=self.dev)
+        return TorchTensor.create_from_torch(data, self, name=name)
+    
+    def delete(self, tensor):
+        pass
+
+    def init_cache_one_gpu_batch(self, config, task, policy):
+        num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
+            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+            policy.gpu_batch_size)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        # NOTE: disable pin_memory due to high memory overhead
+        pin_memory = False
+        k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
+        v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
+        return k_cache, v_cache
 
 
 class TorchDevice:
@@ -656,6 +702,7 @@ class TorchDisk:
     def allocate(self, shape, dtype, pin_memory=None, name=None):
         name = name or TorchTensor.next_name()
         path = os.path.join(self.path, name)
+        # allocate memory on disk - only get loaded to memory when needed
         np.lib.format.open_memmap(path, mode="w+", shape=shape, dtype=dtype)
         return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
                            path, self, name=name)
@@ -744,13 +791,15 @@ class TorchMixedDevice:
         # We have to round to a multiple of `num_head`
         if policy.cache_disk_percent == 0:
             len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_head * num_head
-            len_cpu = shape[SEG_DIM]  - len_gpu
+            len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100)
+            len_cxl = shape[SEG_DIM] - len_cpu - len_gpu
             len_disk = 0
         else:
             len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_head * num_head
             len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100) // num_head * num_head
-            len_disk = shape[SEG_DIM] - len_gpu - len_cpu
-        lens = [len_gpu, len_cpu, len_disk]
+            len_cxl = int(shape[SEG_DIM] * policy.cache_cxl_percent / 100)
+            len_disk = shape[SEG_DIM] - len_gpu - len_cpu - len_cxl
+        lens = [len_gpu, len_cpu, len_cxl, len_disk]
 
         pin_memory = False
         k_cache = self.allocate(shape, np.float16,
@@ -831,9 +880,11 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
     elif src.device.device_type == DeviceType.DISK:
         # The tensor is on the disk, dispatch to copy threads for asynchronous copy
         src.device.submit_copy(dst, dst_indices, src, src_indices)
+        print("Copy from DISK " + src.device.path)
     elif dst.device.device_type == DeviceType.DISK:
         # The tensor is on the disk, dispatch to copy threads for asynchronous copy
         dst.device.submit_copy(dst, dst_indices, src, src_indices)
+        print("Copy to DISK " + src.device.path)
     elif (src.device.device_type == DeviceType.CUDA and
           dst.device.device_type == DeviceType.CPU and
           not dst.data.is_pinned() and src.shape[0] > 1):
@@ -848,6 +899,12 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
         dst = dst.data[dst_indices] if dst_indices else dst.data
         src = src.pin_memory()
         dst.copy_(src, non_blocking=True)
+    elif (src.device.device_type == DeviceType.CPU and
+          dst.device.device_type == DeviceType.CXL):
+          src = src.pin_memory()
+          dst.copy_(src, non_blocking=True)
+    elif (src.device.device_type == DeviceType.CXL and
+          dst.device.device_type == DeviceType.CPU)
     else:
         # The normal path
         src = src.data[src_indices] if src_indices else src.data
